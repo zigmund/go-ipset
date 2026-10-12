@@ -12,21 +12,16 @@ go-ipset requires ipset kernel module and userspace utility version 6.0 or great
 
 Install go-ipset using the "go get" command:
 
-    go get github.com/janeczku/go-ipset/ipset
-
-Install dependencies:
-
-    go get github.com/Sirupsen/logrus
-    go get github.com/coreos/go-semver/semver
+    go get github.com/zigmund/go-ipset
 
 ## API Reference ##
 
-[![GoDoc](https://godoc.org/github.com/google/go-github/github?status.svg)](https://godoc.org/github.com/janeczku/go-ipset/ipset)
+[![Go Reference](https://pkg.go.dev/badge/github.com/zigmund/go-ipset/ipset.svg)](https://pkg.go.dev/github.com/zigmund/go-ipset/ipset)
 
 ## Usage ##
 
 ```go
-import "github.com/janeczku/go-ipset/ipset
+import "github.com/zigmund/go-ipset/ipset"
 ```
 
 #### Create a new set
@@ -69,10 +64,11 @@ You can configure advanced options when creating a new set by supplying the para
 
 ```go
 type Params struct {
-  HashFamily string
-  HashSize   int
-  MaxElem    int
-  Timeout    int
+  HashFamily       string
+  HashSize         int
+  MaxElem          int
+  Timeout          int
+  RecreateOnChange bool
 }
 ```
 See http://ipset.netfilter.org/ipset.man.html for their meaning.
@@ -88,3 +84,28 @@ abusers := ipset.New("ratelimited", "hash:ip", &ipset.Params{Timeout: 60})
 // list is []string
 list ipset.List("customers")
 ```
+
+#### Change parameters of an existing set
+
+Kernel does not allow to change `maxelem` and `timeout` of an existing set, so `New` fails on such set.
+With `RecreateOnChange` the existing set is hot swapped with a new empty set with the specified parameters.
+iptables rules referencing the set are kept, but all entries are lost.
+
+```go
+abusers := ipset.New("ratelimited", "hash:ip", &ipset.Params{MaxElem: 262144, Timeout: 60, RecreateOnChange: true})
+```
+
+#### Show set properties without entries
+
+```go
+// header is *ipset.Header with HashSize, MaxElem, Timeout, Entries, etc.
+header, err := abusers.Header()
+// or by set name
+header, err = ipset.ListHeader("ratelimited")
+```
+
+## Testing ##
+
+Integration tests require root and ipset utility, otherwise they are skipped:
+
+    sudo go test ./...

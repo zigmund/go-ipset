@@ -18,6 +18,8 @@ limitations under the License.
 package ipset
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -29,7 +31,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const minIpsetVersion = "6.0.0"
+const (
+	minIpsetVersion = "6.0.0"
+	maxNameLen      = 31 // IPSET_MAXNAMELEN without trailing zero
+	tempSuffix      = "-temp"
+)
 
 var (
 	ipsetPath            string
@@ -43,6 +49,24 @@ type Params struct {
 	HashSize   int
 	MaxElem    int
 	Timeout    int
+	// RecreateOnChange makes New replace existing set, if its maxelem or timeout
+	// differ from params. Otherwise New fails on such set, because kernel does not
+	// allow to change them. Existing set is hot swapped with a new empty set,
+	// so iptables rules referencing it are kept, but all entries are lost.
+	RecreateOnChange bool
+}
+
+// Header describes set properties reported by kernel.
+type Header struct {
+	Name       string
+	HashType   string
+	HashFamily string
+	HashSize   int
+	MaxElem    int
+	Timeout    int
+	MemSize    int
+	References int
+	Entries    int
 }
 
 // IPSet implements an Interface to an set.
@@ -116,6 +140,17 @@ func New(name string, hashtype string, p *Params) (*IPSet, error) {
 	}
 
 	s := IPSet{name, hashtype, p.HashFamily, p.HashSize, p.MaxElem, p.Timeout}
+
+	if p.RecreateOnChange {
+		// Error means that set does not exist, or will be reported by create below
+		if h, err := ListHeader(name); err == nil && (h.MaxElem != s.MaxElem || h.Timeout != s.Timeout) {
+			log.Infof("Recreating set %s: maxelem %d -> %d, timeout %d -> %d", name, h.MaxElem, s.MaxElem, h.Timeout, s.Timeout)
+			if err = s.swapIn(nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	err := s.createHashSet(name)
 	if err != nil {
 		return nil, err
@@ -126,7 +161,16 @@ func New(name string, hashtype string, p *Params) (*IPSet, error) {
 // Refresh is used to to overwrite the set with the specified entries.
 // The ipset is updated on the fly by hot swapping it with a temporary set.
 func (s *IPSet) Refresh(entries []string) error {
-	tempName := s.Name + "-temp"
+	return s.swapIn(entries)
+}
+
+// swapIn creates a temporary set with the set parameters, fills it with entries
+// and hot swaps it with the set. Old set content is destroyed with the temporary set.
+func (s *IPSet) swapIn(entries []string) error {
+	tempName := tempSetName(s.Name)
+	// Leftover from interrupted swap, if any
+	_ = destroyIPSet(tempName)
+
 	err := s.createHashSet(tempName)
 	if err != nil {
 		return err
@@ -139,13 +183,18 @@ func (s *IPSet) Refresh(entries []string) error {
 	}
 	err = Swap(tempName, s.Name)
 	if err != nil {
+		_ = destroyIPSet(tempName)
 		return err
 	}
-	err = destroyIPSet(tempName)
-	if err != nil {
-		return err
+	return destroyIPSet(tempName)
+}
+
+// tempSetName returns temporary set name, which fits the set name length limit.
+func tempSetName(name string) string {
+	if len(name) > maxNameLen-len(tempSuffix) {
+		name = name[:maxNameLen-len(tempSuffix)]
 	}
-	return nil
+	return name + tempSuffix
 }
 
 // Test is used to check whether the specified entry is in the set or not.
@@ -217,6 +266,87 @@ func (s *IPSet) List() ([]string, error) {
 	return strings.Split(list, "\n"), nil
 }
 
+// Header is used to show the set properties without its entries.
+func (s *IPSet) Header() (*Header, error) {
+	return ListHeader(s.Name)
+}
+
+// ListHeader is used to show properties of the set with the specified name without its entries.
+func ListHeader(name string) (*Header, error) {
+	if err := initCheck(); err != nil {
+		return nil, err
+	}
+	out, err := exec.Command(ipsetPath, "list", "-t", name).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("error listing set %s: %v (%s)", name, err, bytes.TrimSpace(out))
+	}
+	return parseHeader(out)
+}
+
+// parseHeader parses `ipset list -t` output:
+//
+//	Name: test
+//	Type: hash:ip
+//	Revision: 4
+//	Header: family inet hashsize 1024 maxelem 65536 timeout 3600
+//	Size in memory: 88
+//	References: 1
+//	Number of entries: 0
+func parseHeader(out []byte) (*Header, error) {
+	var (
+		h                     Header
+		hasHeader, hasEntries bool
+	)
+
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		key, value, ok := strings.Cut(sc.Text(), ":")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+
+		var err error
+		switch key {
+		case "Name":
+			h.Name = value
+		case "Type":
+			h.HashType = value
+		case "Header":
+			hasHeader = true
+			// Options may be flags without value (counters, comment, ...), so only known ones are parsed
+			fields := strings.Fields(value)
+			for i := 0; i+1 < len(fields) && err == nil; i++ {
+				switch fields[i] {
+				case "family":
+					h.HashFamily = fields[i+1]
+				case "hashsize":
+					h.HashSize, err = strconv.Atoi(fields[i+1])
+				case "maxelem":
+					h.MaxElem, err = strconv.Atoi(fields[i+1])
+				case "timeout":
+					h.Timeout, err = strconv.Atoi(fields[i+1])
+				}
+			}
+		case "Size in memory":
+			h.MemSize, err = strconv.Atoi(value)
+		case "References":
+			h.References, err = strconv.Atoi(value)
+		case "Number of entries":
+			hasEntries = true
+			h.Entries, err = strconv.Atoi(value)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error parsing set header line %q: %v", sc.Text(), err)
+		}
+	}
+
+	if !hasHeader || !hasEntries {
+		return nil, fmt.Errorf("unexpected ipset list output: %q", out)
+	}
+	return &h, nil
+}
+
 // Destroy is used to destroy the set.
 func (s *IPSet) Destroy() error {
 	out, err := exec.Command(ipsetPath, "destroy", s.Name).CombinedOutput()
@@ -238,7 +368,10 @@ func DestroyAll() error {
 
 // Swap is used to hot swap two sets on-the-fly. Use with names of existing sets of the same type.
 func Swap(from, to string) error {
-	out, err := exec.Command(ipsetPath, "swap", from, to).Output()
+	if err := initCheck(); err != nil {
+		return err
+	}
+	out, err := exec.Command(ipsetPath, "swap", from, to).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("error swapping ipset %s to %s: %v (%s)", from, to, err, out)
 	}
@@ -246,7 +379,7 @@ func Swap(from, to string) error {
 }
 
 func destroyIPSet(name string) error {
-	out, err := exec.Command(ipsetPath, "destroy", name).Output()
+	out, err := exec.Command(ipsetPath, "destroy", name).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("error destroying ipset %s: %v (%s)", name, err, out)
 	}
