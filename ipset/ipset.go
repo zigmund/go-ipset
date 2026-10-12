@@ -39,8 +39,8 @@ const (
 
 var (
 	ipsetPath            string
-	errIpsetNotFound     = errors.New("Ipset utility not found")
-	errIpsetNotSupported = errors.New("Ipset utility version is not supported, requiring version >= 6.0")
+	errIpsetNotFound     = errors.New("ipset utility not found")
+	errIpsetNotSupported = errors.New("ipset utility version is not supported, requiring version >= 6.0")
 )
 
 // Params defines optional parameters for creating a new set.
@@ -386,14 +386,6 @@ func destroyIPSet(name string) error {
 	return nil
 }
 
-func destroyAll() error {
-	out, err := exec.Command(ipsetPath, "destroy").Output()
-	if err != nil {
-		return fmt.Errorf("error destroying all ipsetz %s (%s)", err, out)
-	}
-	return nil
-}
-
 func getIpsetSupportedVersion() (bool, error) {
 	minVersion, err := semver.NewVersion(minIpsetVersion)
 	if err != nil {
@@ -422,7 +414,7 @@ func getIpsetVersionString() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	versionMatcher := regexp.MustCompile("v[0-9]+\\.[0-9]+")
+	versionMatcher := regexp.MustCompile(`v[0-9]+\.[0-9]+`)
 	match := versionMatcher.FindStringSubmatch(string(bytes))
 	if match == nil {
 		return "", fmt.Errorf("no ipset version found in string: %s", bytes)
