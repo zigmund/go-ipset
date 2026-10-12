@@ -1,6 +1,6 @@
 module github.com/zigmund/go-ipset
 
-go 1.24
+go 1.27.1
 
 require (
 	github.com/coreos/go-semver v0.3.1
